@@ -1,12 +1,11 @@
 # Purpose: This script converts a Tricare provider list PDF into a CSV file.
 # Vibe coded by Shannon Zoch with assistance from Gemini.
 #
-# Version: 3.0
+# Version: 4.0
 # Changes in this version:
-# - Overhauled the parsing logic to correctly handle providers with physical addresses.
-# - The script now splits the PDF text into individual provider blocks before parsing.
-# - Improved regex to be more flexible with formatting variations in the PDF.
-# - Fixed data cleaning for names, addresses, and specialties.
+# - Set explicit CSV column order and removed the 'Medical Group' column.
+# - Changed the delimiter for multiple specialties from '&' to '-'.
+# - Improved regex to better distinguish between 'Languages Spoken' and 'Specialties' fields.
 
 import re
 import csv
@@ -72,7 +71,8 @@ def parse_provider_data(text):
             name_match = re.search(r"([\w\s,.'-]+, (?:MD|DO))", block)
             phone_match = re.search(r"Phone:\s*(\(\d{3}\)\s*\d{3}-\d{4})", block)
             gender_match = re.search(r"Gender:\s*(Male|Female)", block)
-            languages_match = re.search(r"Languages Spoken:\s*([\w\s,]+)", block)
+            # This regex now captures only the content on the "Languages Spoken" line.
+            languages_match = re.search(r"Languages Spoken:\s*([^\n]+)", block)
             
             # Specialties can be multi-line and are found between "Specialties:" and "Group Affiliations:"
             specialties_block_match = re.search(r"Specialties:\s*([\s\S]*?)(?:\n\s*\n|Group Affiliations:)", block, re.DOTALL)
@@ -86,8 +86,10 @@ def parse_provider_data(text):
             
             if specialties_block_match:
                 specialties_raw = specialties_block_match.group(1).strip()
-                specialties_lines = [line.strip().replace(',', '') for line in specialties_raw.split('\n')]
-                specialties = ' & '.join(filter(None, specialties_lines))
+                # Join multi-line text with a space
+                specialties_text = ' '.join(line.strip() for line in specialties_raw.split('\n'))
+                # Replace commas with ' - ' and clean up extra spaces
+                specialties = re.sub(r'\s*,\s*', ' - ', specialties_text).strip()
             else:
                 specialties = 'N/A'
 
@@ -103,16 +105,11 @@ def parse_provider_data(text):
                 
                 if any("Telemedicine" in s for s in header_lines):
                     service_type = "Telemedicine"
-                    # The medical group is usually the line after "Telemedicine"
-                    try:
-                        # Find the line that is not "Telemedicine"
-                        medical_group = next(line for line in header_lines if "telemedicine" not in line.lower())
-                    except StopIteration:
-                        medical_group = "N/A" # Fallback if no other line is found
                 else:
                     # For physical addresses, the first line is the group, the rest is the address.
                     if header_lines:
-                        medical_group = header_lines[0]
+                        # Medical group is no longer needed in the output, but we still parse it to find the address.
+                        # medical_group = header_lines[0] 
                         address_parts = header_lines[1:]
                         # Filter out distance info (e.g., "1.9 miles") from the address
                         address_parts = [part for part in address_parts if not re.match(r'^\d+\.\d+ miles$', part)]
@@ -121,10 +118,9 @@ def parse_provider_data(text):
             providers.append({
                 'Name': name,
                 'Service Type': service_type,
-                'Medical Group': medical_group,
                 'Phone': phone,
                 'Gender': gender,
-                'Languages': languages,
+                'Languages Spoken': languages,
                 'Specialties': specialties,
             })
         except Exception as e:
@@ -151,10 +147,11 @@ def write_to_csv(providers_data, output_filename):
         return
 
     print(f"Writing data to {output_filename}...")
-    keys = providers_data[0].keys()
+    # Explicitly define the fieldnames to ensure correct column order.
+    fieldnames = ['Name', 'Service Type', 'Phone', 'Gender', 'Languages Spoken', 'Specialties']
     try:
         with open(output_filename, 'w', newline='', encoding='utf-8') as output_file:
-            writer = csv.DictWriter(output_file, fieldnames=keys)
+            writer = csv.DictWriter(output_file, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(providers_data)
         print("CSV file created successfully.")
