@@ -1,11 +1,11 @@
 # Purpose: This script converts a Tricare provider list PDF into a CSV file.
 # Vibe coded by Shannon Zoch with assistance from Gemini.
 #
-# Version: 4.0
+# Version: 5.0
 # Changes in this version:
-# - Set explicit CSV column order and removed the 'Medical Group' column.
-# - Changed the delimiter for multiple specialties from '&' to '-'.
-# - Improved regex to better distinguish between 'Languages Spoken' and 'Specialties' fields.
+# - Added the 'Medical Group' column back into the CSV output.
+# - Implemented a fix to prevent 'Specialties:' from bleeding into the 'Languages Spoken' field.
+# - Updated column order in the final CSV.
 
 import re
 import csv
@@ -71,10 +71,7 @@ def parse_provider_data(text):
             name_match = re.search(r"([\w\s,.'-]+, (?:MD|DO))", block)
             phone_match = re.search(r"Phone:\s*(\(\d{3}\)\s*\d{3}-\d{4})", block)
             gender_match = re.search(r"Gender:\s*(Male|Female)", block)
-            # This regex now captures only the content on the "Languages Spoken" line.
             languages_match = re.search(r"Languages Spoken:\s*([^\n]+)", block)
-            
-            # Specialties can be multi-line and are found between "Specialties:" and "Group Affiliations:"
             specialties_block_match = re.search(r"Specialties:\s*([\s\S]*?)(?:\n\s*\n|Group Affiliations:)", block, re.DOTALL)
 
             # --- Data Cleaning and Assignment ---
@@ -82,13 +79,19 @@ def parse_provider_data(text):
             name = ' '.join(name_match.group(1).replace(',', '').split()) if name_match else 'N/A'
             phone = phone_match.group(1).strip() if phone_match else 'N/A'
             gender = gender_match.group(1).strip() if gender_match else 'N/A'
-            languages = languages_match.group(1).strip().replace(', ', ' & ') if languages_match else 'N/A'
+            
+            if languages_match:
+                languages_text = languages_match.group(1).strip()
+                # Fix for when "Specialties:" gets merged onto the same line
+                if "Specialties:" in languages_text:
+                    languages_text = languages_text.split("Specialties:")[0].strip()
+                languages = languages_text.replace(', ', ' & ')
+            else:
+                languages = 'N/A'
             
             if specialties_block_match:
                 specialties_raw = specialties_block_match.group(1).strip()
-                # Join multi-line text with a space
                 specialties_text = ' '.join(line.strip() for line in specialties_raw.split('\n'))
-                # Replace commas with ' - ' and clean up extra spaces
                 specialties = re.sub(r'\s*,\s*', ' - ', specialties_text).strip()
             else:
                 specialties = 'N/A'
@@ -97,7 +100,6 @@ def parse_provider_data(text):
             
             service_type = ''
             medical_group = ''
-            # Extract the header block between the doctor's name and their phone number
             header_block_match = re.search(r"(?:MD|DO)\s*\n([\s\S]*?)Phone:", block)
             
             if header_block_match:
@@ -105,26 +107,27 @@ def parse_provider_data(text):
                 
                 if any("Telemedicine" in s for s in header_lines):
                     service_type = "Telemedicine"
+                    try:
+                        medical_group = next(line for line in header_lines if "telemedicine" not in line.lower())
+                    except StopIteration:
+                        medical_group = "N/A"
                 else:
-                    # For physical addresses, the first line is the group, the rest is the address.
                     if header_lines:
-                        # Medical group is no longer needed in the output, but we still parse it to find the address.
-                        # medical_group = header_lines[0] 
+                        medical_group = header_lines[0]
                         address_parts = header_lines[1:]
-                        # Filter out distance info (e.g., "1.9 miles") from the address
                         address_parts = [part for part in address_parts if not re.match(r'^\d+\.\d+ miles$', part)]
                         service_type = ' '.join(address_parts)
 
             providers.append({
                 'Name': name,
                 'Service Type': service_type,
+                'Medical Group': medical_group,
                 'Phone': phone,
                 'Gender': gender,
                 'Languages Spoken': languages,
                 'Specialties': specialties,
             })
         except Exception as e:
-            # This helps debug by showing which blocks failed to parse.
             print(f"--- Skipping a block due to parsing error: {e} ---")
             print(f"{block[:250]}...")
             print("-------------------------------------------------")
@@ -148,7 +151,7 @@ def write_to_csv(providers_data, output_filename):
 
     print(f"Writing data to {output_filename}...")
     # Explicitly define the fieldnames to ensure correct column order.
-    fieldnames = ['Name', 'Service Type', 'Phone', 'Gender', 'Languages Spoken', 'Specialties']
+    fieldnames = ['Name', 'Service Type', 'Medical Group', 'Phone', 'Gender', 'Languages Spoken', 'Specialties']
     try:
         with open(output_filename, 'w', newline='', encoding='utf-8') as output_file:
             writer = csv.DictWriter(output_file, fieldnames=fieldnames)
