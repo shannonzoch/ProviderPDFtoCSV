@@ -1,9 +1,12 @@
 # Purpose: This script converts a Tricare provider list PDF into a CSV file.
 # Vibe coded by Shannon Zoch with assistance from Gemini.
 #
-# Version: 2.0
+# Version: 3.0
 # Changes in this version:
-# - Input and output filenames are now passed as command-line arguments.
+# - Overhauled the parsing logic to correctly handle providers with physical addresses.
+# - The script now splits the PDF text into individual provider blocks before parsing.
+# - Improved regex to be more flexible with formatting variations in the PDF.
+# - Fixed data cleaning for names, addresses, and specialties.
 
 import re
 import csv
@@ -26,6 +29,7 @@ def extract_text_from_pdf(pdf_path):
         with open(pdf_path, 'rb') as pdf_file:
             pdf_reader = PyPDF2.PdfReader(pdf_file)
             for page in pdf_reader.pages:
+                # Adding a space helps prevent words from merging across lines
                 full_text += page.extract_text() + "\n"
         print("Successfully extracted text.")
         return full_text
@@ -39,7 +43,8 @@ def extract_text_from_pdf(pdf_path):
 
 def parse_provider_data(text):
     """
-    Parses provider information from the extracted PDF text using regex.
+    Parses provider information from the extracted PDF text. This version first
+    splits the text into blocks for each provider and then parses each block.
 
     Args:
         text (str): The raw text extracted from the PDF.
@@ -51,62 +56,85 @@ def parse_provider_data(text):
     print("Parsing provider data...")
     providers = []
 
-    # Regex to capture a complete provider block. This pattern looks for key fields
-    # like Name, Phone, Gender, Languages, and Specialties.
-    # It handles both physical addresses and "Telemedicine".
-    pattern = re.compile(
-        r"(?P<name>[\w\s,]+, \w+, MD|[\w\s,]+, DO)\n"  # Name (e.g., Adkins, Amanda C, MD)
-        r"\s*(?P<service_type>Telemedicine|[\s\S]*?Phone:)" # Service type (Telemedicine or address block)
-        r"\s*(?P<group>[\w\s&'().-]+?)\n" # Medical Group
-        r"\s*Phone:\s*(?P<phone>\(\d{3}\)\s*\d{3}-\d{4})" # Phone
-        r"[\s\S]*?" # Ignore Fax, After Hours, etc.
-        r"Gender:\s*(?P<gender>Male|Female)\n" # Gender
-        r"\s*Languages Spoken:\s*(?P<languages>[\w\s,]+)\n" # Languages
-        r"\s*Specialties:\s*(?P<specialties>[\s\S]*?)\n" # Specialties block
-        r"\s*Group Affiliations:", # Stop capturing before Group Affiliations
-        re.MULTILINE
-    )
+    # Split the text into blocks, where each block starts with a provider's name.
+    # The regex uses a positive lookahead `(?=...)` to split the text *before* the
+    # name pattern, keeping the name in the resulting block.
+    provider_blocks = re.split(r'\n(?=[\w\s,.\'-]+, (?:MD|DO)\n)', text)
 
-    for match in pattern.finditer(text):
-        data = match.groupdict()
+    for block in provider_blocks:
+        # Skip any blocks that don't look like a valid provider entry.
+        if "Phone:" not in block or "Gender:" not in block:
+            continue
 
-        # --- Data Cleaning ---
+        try:
+            # --- Field Extraction using targeted regex ---
 
-        # 1. Clean up the Name
-        name = ' '.join(data['name'].replace(',', '').split())
+            name_match = re.search(r"([\w\s,.'-]+, (?:MD|DO))", block)
+            phone_match = re.search(r"Phone:\s*(\(\d{3}\)\s*\d{3}-\d{4})", block)
+            gender_match = re.search(r"Gender:\s*(Male|Female)", block)
+            languages_match = re.search(r"Languages Spoken:\s*([\w\s,]+)", block)
+            
+            # Specialties can be multi-line and are found between "Specialties:" and "Group Affiliations:"
+            specialties_block_match = re.search(r"Specialties:\s*([\s\S]*?)(?:\n\s*\n|Group Affiliations:)", block, re.DOTALL)
 
-        # 2. Clean up Service Type
-        service_type = data['service_type'].strip()
-        if service_type != 'Telemedicine':
-            # If it's an address, clean it up by removing the trailing "Phone:"
-            # and consolidating whitespace.
-            address_text = service_type.rsplit('Phone:', 1)[0]
-            service_type = ' '.join(address_text.split()).strip()
-        
-        # 3. Clean up Medical Group
-        medical_group = ' '.join(data['group'].strip().split())
-        # Sometimes the address bleeds into the group name, remove it.
-        if "Phone:" in medical_group:
-            medical_group = medical_group.split("Phone:")[0].strip()
+            # --- Data Cleaning and Assignment ---
+
+            name = ' '.join(name_match.group(1).replace(',', '').split()) if name_match else 'N/A'
+            phone = phone_match.group(1).strip() if phone_match else 'N/A'
+            gender = gender_match.group(1).strip() if gender_match else 'N/A'
+            languages = languages_match.group(1).strip().replace(', ', ' & ') if languages_match else 'N/A'
+            
+            if specialties_block_match:
+                specialties_raw = specialties_block_match.group(1).strip()
+                specialties_lines = [line.strip().replace(',', '') for line in specialties_raw.split('\n')]
+                specialties = ' & '.join(filter(None, specialties_lines))
+            else:
+                specialties = 'N/A'
+
+            # --- Logic for Service Type (Address) and Medical Group ---
+            
+            service_type = ''
+            medical_group = ''
+            # Extract the header block between the doctor's name and their phone number
+            header_block_match = re.search(r"(?:MD|DO)\s*\n([\s\S]*?)Phone:", block)
+            
+            if header_block_match:
+                header_lines = [line.strip() for line in header_block_match.group(1).strip().split('\n') if line.strip()]
+                
+                if any("Telemedicine" in s for s in header_lines):
+                    service_type = "Telemedicine"
+                    # The medical group is usually the line after "Telemedicine"
+                    try:
+                        # Find the line that is not "Telemedicine"
+                        medical_group = next(line for line in header_lines if "telemedicine" not in line.lower())
+                    except StopIteration:
+                        medical_group = "N/A" # Fallback if no other line is found
+                else:
+                    # For physical addresses, the first line is the group, the rest is the address.
+                    if header_lines:
+                        medical_group = header_lines[0]
+                        address_parts = header_lines[1:]
+                        # Filter out distance info (e.g., "1.9 miles") from the address
+                        address_parts = [part for part in address_parts if not re.match(r'^\d+\.\d+ miles$', part)]
+                        service_type = ' '.join(address_parts)
+
+            providers.append({
+                'Name': name,
+                'Service Type': service_type,
+                'Medical Group': medical_group,
+                'Phone': phone,
+                'Gender': gender,
+                'Languages': languages,
+                'Specialties': specialties,
+            })
+        except Exception as e:
+            # This helps debug by showing which blocks failed to parse.
+            print(f"--- Skipping a block due to parsing error: {e} ---")
+            print(f"{block[:250]}...")
+            print("-------------------------------------------------")
 
 
-        # 4. Clean up Specialties
-        # The specialties can span multiple lines. We join them with " & ".
-        specialties_raw = data['specialties'].strip()
-        specialties_lines = [line.strip() for line in specialties_raw.split('\n')]
-        specialties = ' & '.join(filter(None, specialties_lines))
-
-        providers.append({
-            'Name': name,
-            'Service Type': service_type,
-            'Medical Group': medical_group,
-            'Phone': data['phone'].strip(),
-            'Gender': data['gender'].strip(),
-            'Languages': data['languages'].strip().replace(', ', ' & '),
-            'Specialties': specialties,
-        })
-
-    print(f"Found {len(providers)} providers.")
+    print(f"Found and parsed {len(providers)} providers.")
     return providers
 
 
